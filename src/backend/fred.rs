@@ -1,26 +1,9 @@
 use crate::backend::{Backend, SimpleBackend, SimpleInput, SimpleOutput};
-use actix_web::rt::time::Instant;
-use actix_web::{HttpResponse, ResponseError};
+use actix_web::{rt::time::Instant, HttpResponse, ResponseError};
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
-use std::borrow::Cow;
-use std::time::Duration;
+use fred::prelude::*;
+use std::{borrow::Cow, time::Duration};
 use thiserror::Error;
-
-// https://github.com/mitsuhiko/redis-rs/issues/353
-macro_rules! async_transaction {
-    ($conn:expr, $keys:expr, $body:expr) => {
-        loop {
-            redis::cmd("WATCH").arg($keys).query_async($conn).await?;
-
-            if let Some(response) = $body {
-                redis::cmd("UNWATCH").query_async($conn).await?;
-                break response;
-            }
-        }
-    };
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum Error {
@@ -28,10 +11,8 @@ pub enum Error {
     Redis(
         #[source]
         #[from]
-        redis::RedisError,
+        fred::error::RedisError,
     ),
-    #[error("Unexpected negative TTL response")]
-    NegativeTtl,
 }
 
 impl ResponseError for Error {
@@ -43,29 +24,12 @@ impl ResponseError for Error {
 /// A Fixed Window rate limiter [Backend] that uses stores data in Redis.
 #[derive(Clone)]
 pub struct RedisBackend {
-    connection: ConnectionManager,
+    connection: RedisClient,
     key_prefix: Option<String>,
 }
 
 impl RedisBackend {
-    /// Create a RedisBackendBuilder.
-    ///
-    /// # Arguments
-    ///
-    /// * `pool`: [A Redis connection pool](https://github.com/importcjj/mobc-redis)
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use actix_extensible_rate_limit::backend::redis::RedisBackend;
-    /// # use redis::aio::ConnectionManager;
-    /// # async {
-    /// let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-    /// let manager = ConnectionManager::new(client).await.unwrap();
-    /// let backend = RedisBackend::builder(manager).build();
-    /// # };
-    /// ```
-    pub fn builder(connection: ConnectionManager) -> Builder {
+    pub fn builder(connection: RedisClient) -> Builder {
         Builder {
             connection,
             key_prefix: None,
@@ -81,7 +45,7 @@ impl RedisBackend {
 }
 
 pub struct Builder {
-    connection: ConnectionManager,
+    connection: RedisClient,
     key_prefix: Option<String>,
 }
 
@@ -114,27 +78,17 @@ impl Backend<SimpleInput> for RedisBackend {
         input: SimpleInput,
     ) -> Result<(bool, Self::Output, Self::RollbackToken), Self::Error> {
         let key = self.make_key(&input.key);
-        // https://github.com/actix/actix-extras/blob/master/actix-limitation/src/lib.rs#L123
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .cmd("SET") // Set key and value
-            .arg(key.as_ref())
-            .arg(0i64)
-            .arg("EX") // Set the specified expire time, in seconds.
-            .arg(input.interval.as_secs())
-            .arg("NX") // Only set the key if it does not already exist.
-            .ignore() // --- ignore returned value of SET command ---
-            .cmd("INCR") // Increment key
-            .arg(key.as_ref())
-            .cmd("TTL") // Return time-to-live of key
-            .arg(key.as_ref());
+        let pipeline = self.connection.pipeline();
+        let ex = Expiration::EX(input.interval.as_secs() as i64);
+        let opt = SetOptions::NX;
 
-        let mut con = self.connection.clone();
-        let (count, ttl): (u64, i64) = pipe.query_async(&mut con).await?;
-        // let (count, ttl): (u64, i64) = retry_io(|c, p| p.query_async(c), 2, &mut con, &pipe).await?;
-        if ttl < 0 {
-            return Err(Self::Error::NegativeTtl);
-        }
+        let _: () = pipeline
+            .set(key.as_ref(), 0, Some(ex), Some(opt), false)
+            .await
+            .unwrap();
+        let _: () = pipeline.incr(key.as_ref()).await.unwrap();
+        let _: () = pipeline.ttl(key.as_ref()).await.unwrap();
+        let (_, count, ttl): ((), u64, u64) = pipeline.all().await?;
 
         let allow = count <= input.max_requests;
         let output = SimpleOutput {
@@ -147,57 +101,19 @@ impl Backend<SimpleInput> for RedisBackend {
 
     async fn rollback(&self, token: Self::RollbackToken) -> Result<(), Self::Error> {
         let key = self.make_key(&token);
-        let mut con = self.connection.clone();
-        async_transaction!(&mut con, &[key.as_ref()], {
-            let old_val: Option<u64> = con.get(key.as_ref()).await?;
-            if let Some(old_val) = old_val {
-                if old_val >= 1 {
-                    redis::pipe()
-                        .atomic()
-                        .decr::<_, u64>(key.as_ref(), 1)
-                        .ignore()
-                        .query_async::<_, Option<()>>(&mut con)
-                        .await?
-                } else {
-                    Some(())
-                }
-            } else {
-                Some(())
+
+        self.connection.watch(key.as_ref()).await?;
+        let trx = &self.connection;
+        let old_val: Option<u64> = trx.get(key.as_ref()).await?;
+        if let Some(old_val) = old_val {
+            if old_val >= 1 {
+                trx.decr(key.as_ref()).await?;
             }
-        });
+        }
+        self.connection.unwatch().await?;
         Ok(())
     }
 }
-
-/* pub async fn retry_io<'a, O, F, R,B>(mut f: F, n: usize, con: &'a mut ConnectionManager, b: &'a B) -> Result<O, RedisError>
-where
-    F: FnMut(&'a mut ConnectionManager, &'a B) -> R +'a,
-    R: Future<Output = Result<O, RedisError>> +'a,
-    O: 'a,
-    B: 'a,
-    R: 'a
-{
-    // at least try once.
-    let n = n.max(1);
-    let mut count = 0;
-    loop {
-        match f(con, &b).await {
-            Ok(k) => return Ok(k),
-            Err(redis) => {
-                if redis.is_io_error() || redis.is_connection_dropped() {
-                    // Just return the error if no more retries are permitted.
-                    if count > n {
-                        return Err(redis);
-                    }
-
-                    // retry
-                    count += 1;
-                    continue;
-                }
-            }
-        };
-    }
-} */
 
 #[async_trait(?Send)]
 impl SimpleBackend for RedisBackend {
@@ -205,7 +121,7 @@ impl SimpleBackend for RedisBackend {
     /// it yourself.
     async fn remove_key(&self, key: &str) -> Result<(), Self::Error> {
         let key = self.make_key(key);
-        let mut con = self.connection.clone();
+        let con = self.connection.clone();
         con.del(key.as_ref()).await?;
         Ok(())
     }
@@ -221,12 +137,16 @@ mod tests {
     // Each test must use non-overlapping keys (because the tests may be run concurrently)
     // Each test should also reset its key on each run, so that it is in a clean state.
     async fn make_backend(clear_test_key: &str) -> Builder {
-        let host = option_env!("REDIS_HOST").unwrap_or("127.0.0.1");
-        let port = option_env!("REDIS_PORT").unwrap_or("6379");
-        let client = redis::Client::open(format!("redis://{host}:{port}")).unwrap();
+        /* let client = redis::Client::open(format!("redis://{host}:{port}")).unwrap();
         let mut manager = ConnectionManager::new(client).await.unwrap();
-        manager.del::<_, ()>(clear_test_key).await.unwrap();
-        RedisBackend::builder(manager)
+        manager.del::<_, ()>(clear_test_key).await.unwrap(); */
+        // RedisBackend::builder(manager)
+        let config = RedisConfig::from_url("redis://default:mypassword@127.0.0.1:6379/1").unwrap();
+        let client = RedisClient::new(config, None, None);
+        let _ = client.connect();
+        let _ = client.wait_for_connect().await.unwrap();
+        client.del::<(), _>(clear_test_key).await.unwrap();
+        RedisBackend::builder(client)
     }
 
     #[actix_web::test]
@@ -316,7 +236,7 @@ mod tests {
     #[actix_web::test]
     async fn test_rollback_key_gone() {
         let backend = make_backend("test_rollback_key_gone").await.build();
-        let mut con = backend.connection.clone();
+        let con = backend.connection.clone();
         // The rollback could happen after the key has already expired
         backend
             .rollback("test_rollback_key_gone".to_string())
@@ -324,7 +244,7 @@ mod tests {
             .unwrap();
         // In which case nothing should happen
         assert!(!con
-            .exists::<_, bool>("test_rollback_key_gone")
+            .exists::<bool, _>("test_rollback_key_gone")
             .await
             .unwrap());
     }
@@ -353,7 +273,7 @@ mod tests {
             .await
             .key_prefix(Some("prefix:"))
             .build();
-        let mut con = backend.connection.clone();
+        let con = backend.connection.clone();
         let input = SimpleInput {
             interval: MINUTE,
             max_requests: 5,
@@ -361,13 +281,13 @@ mod tests {
         };
         backend.request(input.clone()).await.unwrap();
         assert!(con
-            .exists::<_, bool>("prefix:test_key_prefix")
+            .exists::<bool, _>("prefix:test_key_prefix")
             .await
             .unwrap());
 
         backend.remove_key("test_key_prefix").await.unwrap();
         assert!(!con
-            .exists::<_, bool>("prefix:test_key_prefix")
+            .exists::<bool, _>("prefix:test_key_prefix")
             .await
             .unwrap());
     }

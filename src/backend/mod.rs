@@ -1,5 +1,8 @@
 mod input_builder;
 
+#[cfg(feature = "fred")]
+pub mod fred;
+
 #[cfg(feature = "dashmap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dashmap")))]
 pub mod memory;

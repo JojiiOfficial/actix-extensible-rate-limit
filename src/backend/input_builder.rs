@@ -7,7 +7,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 type CustomFn = Box<dyn Fn(&ServiceRequest) -> Result<String, actix_web::Error>>;
-type ExtCustomFn = Box<dyn Fn(&ServiceRequest) -> Result<(String, Option<Duration>, Option<u64>), actix_web::Error>>;
+type ExtCustomFn = Box<
+    dyn Fn(&ServiceRequest) -> Result<(String, Option<Duration>, Option<u64>), actix_web::Error>,
+>;
 
 pub type SimpleInputFuture = Ready<Result<SimpleInput, actix_web::Error>>;
 
@@ -123,7 +125,8 @@ impl SimpleInputFunctionBuilder {
     /// ```
     pub fn ext_custom_fn<F>(mut self, f: F) -> Self
     where
-        F: Fn(&ServiceRequest) -> Result<(String, Option<Duration>, Option<u64>), actix_web::Error> + 'static,
+        F: Fn(&ServiceRequest) -> Result<(String, Option<Duration>, Option<u64>), actix_web::Error>
+            + 'static,
     {
         self.ext_custom_fn = Some(Box::new(f));
         self
